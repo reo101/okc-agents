@@ -3,6 +3,7 @@ name = "okc-agents"
 version = "0.1.2"
 authors = ["DDoSolitary <DDoSolitary@gmail.com>"]
 edition = "2018"
+description = "SSH agent for a utility that makes OpenKeychain available in your Termux shell"
 
 [dependencies]
 base64 = "0.13.0"
