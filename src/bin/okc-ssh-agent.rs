@@ -90,7 +90,10 @@ async fn handle_ssh_connection(mut client_stream: UnixStream, log: Logger) -> Re
     let port = app_listener.local_addr()?.port();
     info!(log, "Listening for app on TCP port {}", port);
 
-    let status = Command::new("am")
+    // TODO: deduplicate
+    let am_command = std::env::var("AM").unwrap_or_else(|_| "am".to_string());
+
+    let status = Command::new(am_command)
         .arg("broadcast")
         .arg("-n")
         .arg(SSH_APP_RECEIVER)

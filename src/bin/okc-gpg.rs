@@ -2,6 +2,7 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use clap::{ArgAction, Parser};
 use eyre::{bail, Context, Result};
 use slog::{debug, error, info, o, warn, Drain, Logger};
+use tokio::task::JoinHandle;
 use std::time::Duration;
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -180,16 +181,16 @@ fn reconstruct_args(args: &GpgArgs) -> Vec<String> {
 }
 
 async fn run_gpg_proxy(args: GpgArgs, log: Logger) -> Result<()> {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .context("Failed to bind to an ephemeral port")?;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
     info!(log, "Listening for app connections on port {}", port);
 
-    // Reconstruct args and send broadcast
+    // TODO: deduplicate
+    let am_command = std::env::var("AM").unwrap_or_else(|_| "am".to_string());
+
+    let mut cmd = tokio::process::Command::new(am_command);
     let gpg_args_for_app = reconstruct_args(&args);
 
-    let mut cmd = tokio::process::Command::new("am");
     cmd.arg("broadcast")
         .arg("-n")
         .arg(GPG_APP_RECEIVER)
@@ -210,30 +211,56 @@ async fn run_gpg_proxy(args: GpgArgs, log: Logger) -> Result<()> {
             .arg("org.ddosolitary.okcagent.extra.GPG_ARGS")
             .arg(encoded_args);
     }
+
     cmd.status()
         .await
-        .context("Failed to send 'am broadcast' to the Android app.")?;
+        .context("Failed to send 'am broadcast'")?;
     info!(
         log,
-        "Broadcast sent. Waiting for 3 connections from the app..."
+        "Broadcast sent. Waiting for connections from the app..."
     );
 
-    // The rest of the logic remains the same...
-    let (control, input, output) = time::timeout(
-        Duration::from_secs(15),
-        accept_all_connections(&listener, &log),
-    )
-    .await
-    .context("Timed out waiting for the app to establish all 3 connections.")??;
+    // Accept connections one by one and spawn handlers immediately.
+    let mut control_handle: Option<JoinHandle<Result<u8>>> = None;
+    let mut input_handle: Option<JoinHandle<Result<()>>> = None;
+    let mut output_handle: Option<JoinHandle<Result<()>>> = None;
 
-    let (control_result, _, _) = tokio::try_join!(
-        tokio::spawn(handle_control_connection(control, log.clone())),
-        tokio::spawn(handle_input_connection(input, log.clone())),
-        tokio::spawn(handle_output_connection(output, log.clone()))
-    )
-    .context("A concurrent connection handler failed.")?;
+    for _ in 0..=2 {
+        let (mut stream, addr) = time::timeout(Duration::from_secs(15), listener.accept())
+            .await
+            .context("Timed out waiting for an app connection.")??;
 
-    let exit_code = control_result.context("Control connection task panicked.")?;
+        let op_type = stream
+            .read_u8()
+            .await
+            .context("Failed to read connection type")?;
+        debug!(log, "Accepted connection"; "from" => addr, "type" => op_type);
+
+        match op_type {
+            0 => {
+                control_handle = Some(tokio::spawn(handle_control_connection(stream, log.clone())))
+            }
+            1 => input_handle = Some(tokio::spawn(handle_input_connection(stream, log.clone()))),
+            2 => output_handle = Some(tokio::spawn(handle_output_connection(stream, log.clone()))),
+            _ => bail!("Invalid connection type received: {}", op_type),
+        };
+    }
+
+    // Ensure all three essential handlers were started.
+    let (control, input, output) = match (control_handle, input_handle, output_handle) {
+        (Some(c), Some(i), Some(o)) => (c, i, o),
+        _ => bail!("Failed to establish all three required connections."),
+    };
+
+    // Wait for all handlers to complete.
+    let (control_result, input_result, output_result) = tokio::try_join!(control, input, output)
+        .context("A concurrent connection handler panicked or failed.")?;
+
+    // Check individual results
+    input_result.context("Input handler failed.")?;
+    output_result.context("Output handler failed.")?;
+    let exit_code = control_result.context("Control handler failed.")?;
+
     info!(
         log,
         "All connections finished. Final status code: {}", exit_code
@@ -243,38 +270,6 @@ async fn run_gpg_proxy(args: GpgArgs, log: Logger) -> Result<()> {
         Ok(())
     } else {
         bail!("The app reported an error (status code: {})", exit_code)
-    }
-}
-
-/// Accepts connections and sorts them into control, input, and output streams.
-async fn accept_all_connections(
-    listener: &TcpListener,
-    log: &Logger,
-) -> Result<(TcpStream, TcpStream, TcpStream)> {
-    let mut control = None;
-    let mut input = None;
-    let mut output = None;
-
-    for _ in 0..3 {
-        let (mut stream, addr) = listener.accept().await?;
-        let op_type = stream
-            .read_u8()
-            .await
-            .context("Failed to read connection type")?;
-        debug!(log, "Accepted connection"; "from" => addr, "type" => op_type);
-
-        match op_type {
-            0 => control = Some(stream),
-            1 => input = Some(stream),
-            2 => output = Some(stream),
-            _ => bail!("Invalid connection type received: {}", op_type),
-        };
-    }
-
-    if let (Some(c), Some(i), Some(o)) = (control, input, output) {
-        Ok((c, i, o))
-    } else {
-        bail!("Failed to establish all three required connections (control, input, output).")
     }
 }
 
