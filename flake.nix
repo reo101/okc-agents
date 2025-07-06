@@ -4,75 +4,66 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
     naersk.url = "github:nmattia/naersk";
-    naersk.inputs.nixpkgs.follows = "nixpkgs";
+    flake-parts.url = "github:hercules-ci/flake-parts";
+    systems.url = "github:nix-systems/default";
   };
 
-  outputs = { self, nixpkgs, naersk }:
-    let
-      cargoToml = (builtins.fromTOML (builtins.readFile ./Cargo.toml));
-      supportedSystems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" ];
-      forAllSystems = f: nixpkgs.lib.genAttrs supportedSystems (system: f system);
-    in
-    {
-      overlay = final: prev: {
-        "${cargoToml.package.name}" = final.callPackage ./. { inherit naersk; };
-      };
+  outputs =
+    inputs:
+    inputs.flake-parts.lib.mkFlake { inherit inputs; } {
+      systems = import inputs.systems;
 
-      packages = forAllSystems (system:
+      perSystem =
+        {
+          config,
+          pkgs,
+          lib,
+          ...
+        }:
         let
-          pkgs = import nixpkgs {
-            inherit system;
-            overlays = [
-              self.overlay
-            ];
-          };
+          cargoToml = lib.pipe ./Cargo.toml [
+            builtins.readFile
+            builtins.fromTOML
+          ];
+          packageName = cargoToml.package.name;
+          okc-agent = pkgs.callPackage ./. { naersk = pkgs.callPackage inputs.naersk { }; };
         in
         {
-          "${cargoToml.package.name}" = pkgs."${cargoToml.package.name}";
-        });
+          packages.${packageName} = okc-agent;
 
+          packages.default = config.packages.${packageName};
 
-      defaultPackage = forAllSystems (system: (import nixpkgs {
-        inherit system;
-        overlays = [ self.overlay ];
-      })."${cargoToml.package.name}");
+          checks = {
+            format =
+              pkgs.runCommand "check-format"
+                {
+                  nativeBuildInputs = with pkgs; [
+                    rustfmt
+                    cargo
+                    nixpkgs-fmt
+                  ];
+                }
+                ''
+                  ${lib.getExe' pkgs.rustfmt "cargo-fmt"} fmt --manifest-path ${./.}/Cargo.toml -- --check
+                  ${lib.getExe pkgs.nixfmt-rfc-style} --check ${./.}
+                  touch $out
+                '';
+            ${packageName} = config.packages.${packageName};
+          };
 
-      checks = forAllSystems (system:
-        let
-          pkgs = import nixpkgs {
-            inherit system;
-            overlays = [
-              self.overlay
+          devShells.default = pkgs.mkShell {
+            inputsFrom = [ config.packages.${packageName} ];
+            nativeBuildInputs = with pkgs; [
+              # Rust
+              rustup # for rust-analyzer
+              rustfmt
+
+              # Nix
+              nil
+              nixfmt-rfc-style
             ];
+            env.LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
           };
-        in
-        {
-          format = pkgs.runCommand "check-format"
-            {
-              buildInputs = with pkgs; [ rustfmt cargo ];
-            } ''
-            ${pkgs.rustfmt}/bin/cargo-fmt fmt --manifest-path ${./.}/Cargo.toml -- --check
-            ${pkgs.nixpkgs-fmt}/bin/nixpkgs-fmt --check ${./.}
-            touch $out # it worked!
-          '';
-          "${cargoToml.package.name}" = pkgs."${cargoToml.package.name}";
-        });
-      devShell = forAllSystems (system:
-        let
-          pkgs = import nixpkgs {
-            inherit system;
-            overlays = [ self.overlay ];
-          };
-        in
-        pkgs.mkShell {
-          inputsFrom = with pkgs; [
-            pkgs."${cargoToml.package.name}"
-          ];
-          buildInputs = with pkgs; [
-            rustfmt
-            nixpkgs-fmt
-          ];
-          LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
-        });
+        };
     };
 }
