@@ -2,10 +2,19 @@
   description = "okc-agents for termux (or nix-on-droid)";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
-    naersk.url = "github:nmattia/naersk";
-    flake-parts.url = "github:hercules-ci/flake-parts";
-    systems.url = "github:nix-systems/default";
+    nixpkgs = {
+      url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    };
+    naersk = {
+      url = "github:nmattia/naersk";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+    flake-parts = {
+      url = "github:hercules-ci/flake-parts";
+    };
+    systems = {
+      url = "github:nix-systems/default";
+    };
   };
 
   outputs =
@@ -21,12 +30,21 @@
           ...
         }:
         let
-          cargoToml = lib.pipe ./Cargo.toml [
-            builtins.readFile
-            builtins.fromTOML
-          ];
+          fs = lib.fileset;
+          src = fs.toSource {
+            root = ./.;
+            fileset = fs.unions [
+              ./Cargo.toml
+              ./Cargo.lock
+              ./src
+            ];
+          };
+          cargoToml = lib.importTOML ./Cargo.toml;
           packageName = cargoToml.package.name;
-          okc-agent = pkgs.callPackage ./. { naersk = pkgs.callPackage inputs.naersk { }; };
+          okc-agent = pkgs.callPackage ./default.nix {
+            inherit src;
+            naersk = pkgs.callPackage inputs.naersk { };
+          };
         in
         {
           packages.${packageName} = okc-agent;
@@ -40,12 +58,12 @@
                   nativeBuildInputs = with pkgs; [
                     rustfmt
                     cargo
-                    nixpkgs-fmt
+                    nixfmt-rfc-style
                   ];
                 }
                 ''
-                  ${lib.getExe' pkgs.rustfmt "cargo-fmt"} fmt --manifest-path ${./.}/Cargo.toml -- --check
-                  ${lib.getExe pkgs.nixfmt-rfc-style} --check ${./.}
+                  ${lib.getExe' pkgs.rustfmt "cargo-fmt"} fmt --manifest-path ${src}/Cargo.toml -- --check
+                  ${lib.getExe pkgs.nixfmt-rfc-style} --check ${src}
                   touch $out
                 '';
             ${packageName} = config.packages.${packageName};
@@ -53,16 +71,15 @@
 
           devShells.default = pkgs.mkShell {
             inputsFrom = [ config.packages.${packageName} ];
-            nativeBuildInputs = with pkgs; [
-              # Rust
-              rustup # for rust-analyzer
+            packages = with pkgs; [
+              cargo
+              clippy
+              rust-analyzer
+              rustc
               rustfmt
-
-              # Nix
               nil
               nixfmt-rfc-style
             ];
-            env.LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
           };
         };
     };

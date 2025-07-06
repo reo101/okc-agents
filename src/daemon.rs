@@ -1,6 +1,6 @@
-use crate::cli::{print_kill_vars, KillArgs, AGENT_PID_ENV};
+use crate::cli::{AGENT_PID_ENV, KillArgs, print_kill_vars};
 use eyre::{Context, ContextCompat, Result};
-use nix::sys::signal::{kill, Signal};
+use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use std::env;
 use std::path::Path;

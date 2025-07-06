@@ -1,6 +1,11 @@
+# Rust
 /target
 **/*.rs.bk
-.idea/
 
-.direnv
-result
+# Nix
+/.direnv/
+/result
+/result-*
+
+# Editors
+/.idea/

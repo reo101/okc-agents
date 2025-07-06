@@ -13,12 +13,12 @@ pub trait HasShellArgs {
 #[derive(Parser, Debug)]
 pub struct ShellArgs {
     /// Generate C-shell commands on stdout.
-    #[arg(short, long, group = "shell")]
+    #[arg(short = 'c', long, group = "shell")]
     pub csh: bool,
 
     /// Generate Bourne shell (sh, bash, zsh) commands on stdout.
-    #[arg(short = 's', long, group = "shell")]
-    pub bash: bool,
+    #[arg(short = 's', long = "sh", visible_alias = "bash", group = "shell")]
+    pub sh: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -44,7 +44,7 @@ impl<T: HasShellArgs> From<&T> for Shell {
         let shell_args = args.shell_args();
         if shell_args.csh {
             Shell::Csh
-        } else if shell_args.bash {
+        } else if shell_args.sh {
             Shell::Bourne
         } else if let Ok(shell) = env::var("SHELL") {
             if shell.ends_with("csh") {

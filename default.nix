@@ -1,6 +1,7 @@
 {
   lib,
   naersk,
+  src,
   pkg-config,
   libiconv,
 # , llvmPackages # Optional
@@ -8,7 +9,7 @@
 }:
 
 naersk.buildPackage {
-  src = lib.cleanSource ./.;
+  inherit src;
 
   nativeBuildInputs = [
     pkg-config

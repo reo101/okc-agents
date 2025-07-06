@@ -1,13 +1,13 @@
-use base64::{engine::general_purpose::STANDARD, Engine};
-use clap::{ArgAction, Parser};
-use eyre::{bail, Context, Result};
-use okc_agents::android::{am_command, run_am_broadcast};
-use slog::{debug, error, info, o, warn, Drain, Logger};
+use base64::{Engine, engine::general_purpose::STANDARD};
+use clap::Parser;
+use eyre::{Context, ContextCompat, Result, bail};
+use okc_agents::android::{broadcast_command, run_am_broadcast};
+use okc_agents::logging::init_tracing;
 use std::time::Duration;
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::task::JoinHandle;
 use tokio::time;
+use tracing::{debug, error, info, warn};
 
 const FRAME_CHUNK_SIZE: usize = 4 * 1024;
 
@@ -22,33 +22,32 @@ const GPG_APP_RECEIVER: &str = "org.ddosolitary.okcagent/.GpgProxyReceiver";
 #[command(author, version)]
 struct GpgArgs {
     // Actions
-    #[arg(long, short, group = "action", help = "Make a signature")]
+    #[arg(long, short, help = "Make a signature")]
     sign: bool,
     #[arg(
         long,
         visible_alias = "clearsign",
-        group = "action",
         help = "Make a clear text signature"
     )]
     clear_sign: bool,
-    #[arg(
-        long,
-        short = 'b',
-        group = "action",
-        help = "Make a detached signature"
-    )]
+    #[arg(long, short = 'b', help = "Make a detached signature")]
     detach_sign: bool,
-    #[arg(long, short, group = "action", help = "Encrypt data")]
+    #[arg(long, short, help = "Encrypt data")]
     encrypt: bool,
-    #[arg(long, short, group = "action", help = "Decrypt data")]
+    #[arg(long, short, help = "Decrypt data")]
     decrypt: bool,
-    #[arg(long, group = "action", help = "Verify a signature")]
+    #[arg(long, help = "Verify a signature")]
     verify: bool,
 
     // Options
     #[arg(long, short = 'a', help = "Create ASCII armored output")]
     armor: bool,
-    #[arg(long, short, value_name = "USER-ID", action = ArgAction::Append, help = "Encrypt for USER-ID (can be used multiple times)")]
+    #[arg(
+        long,
+        short,
+        value_name = "USER-ID",
+        help = "Encrypt for USER-ID (can be used multiple times)"
+    )]
     recipient: Vec<String>,
     #[arg(long, short = 'o', value_name = "FILE", help = "Write output to FILE")]
     output: Option<String>,
@@ -102,25 +101,85 @@ struct GpgArgs {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let decorator = slog_term::TermDecorator::new().build();
-    let drain = slog_term::FullFormat::new(decorator).build().fuse();
-    let drain = slog_async::Async::new(drain).build().fuse();
-    let log = Logger::root(drain, o!());
+    init_tracing();
 
     let args = GpgArgs::parse();
+    validate_args(&args)?;
+    warn_ignored_options(&args);
 
-    // Warn about ignored options
-    if args.local_user.is_some() {
-        warn!(log, "Option --local-user is ignored by the app");
-    }
-    // Add other warnings for unsupported args here if desired...
-
-    info!(log, "okc-gpg starting"; "version" => env!("CARGO_PKG_VERSION"), "protocol" => GPG_PROTO_VER);
-    if let Err(e) = run_gpg_proxy(args, log.clone()).await {
-        error!(log, "A critical error occurred: {e:?}");
-        return Err(e);
+    info!(
+        version = env!("CARGO_PKG_VERSION"),
+        protocol = GPG_PROTO_VER,
+        "okc-gpg starting"
+    );
+    if let Err(error) = run_gpg_proxy(args).await {
+        error!(error = ?error, "A critical error occurred");
+        return Err(error);
     }
     Ok(())
+}
+
+fn validate_args(args: &GpgArgs) -> Result<()> {
+    let has_action = args.sign
+        || args.clear_sign
+        || args.detach_sign
+        || args.encrypt
+        || args.decrypt
+        || args.verify
+        || args.list_config;
+    if !has_action {
+        bail!("No action selected. Use one of --sign/--encrypt/--decrypt/--verify/--list-config.");
+    }
+
+    if args.list_config
+        && (args.sign
+            || args.clear_sign
+            || args.detach_sign
+            || args.encrypt
+            || args.decrypt
+            || args.verify)
+    {
+        bail!("--list-config cannot be combined with crypto actions.");
+    }
+
+    if args.clear_sign
+        && (args.sign || args.detach_sign || args.encrypt || args.decrypt || args.verify)
+    {
+        bail!("--clear-sign cannot be combined with other crypto actions.");
+    }
+
+    if args.detach_sign
+        && (args.sign || args.clear_sign || args.encrypt || args.decrypt || args.verify)
+    {
+        bail!("--detach-sign cannot be combined with other crypto actions.");
+    }
+
+    if (args.sign || args.encrypt) && (args.decrypt || args.verify) {
+        bail!("Encrypt/sign actions cannot be combined with decrypt/verify actions.");
+    }
+
+    Ok(())
+}
+
+fn warn_ignored_options(args: &GpgArgs) {
+    if args.local_user.is_some() {
+        warn!("Option --local-user is ignored by the app");
+    }
+    if args.default_key {
+        warn!("Option --default-key is ignored by the app");
+    }
+    if args.compress_algo.is_some() {
+        warn!("Option --compress-algo is ignored by the app");
+    }
+    if args.batch {
+        warn!("Option --batch is ignored by the app");
+    }
+    if args.no_batch {
+        warn!("Option --no-batch is ignored by the app");
+    }
+    if args.keyid_format.is_some() {
+        warn!("Option --keyid-format is ignored by the app");
+    }
 }
 
 /// Reconstructs a command-line argument vector from the parsed GpgArgs struct.
@@ -183,18 +242,68 @@ fn reconstruct_args(args: &GpgArgs) -> Vec<String> {
     constructed_args
 }
 
-async fn run_gpg_proxy(args: GpgArgs, log: Logger) -> Result<()> {
+#[derive(Debug)]
+enum ConnectionType {
+    Control,
+    Input,
+    Output,
+}
+
+impl TryFrom<u8> for ConnectionType {
+    type Error = eyre::Report;
+
+    fn try_from(value: u8) -> std::result::Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Control),
+            1 => Ok(Self::Input),
+            2 => Ok(Self::Output),
+            _ => bail!("Invalid connection type received: {value}"),
+        }
+    }
+}
+
+#[derive(Default)]
+struct AppConnections {
+    control: Option<TcpStream>,
+    input: Option<TcpStream>,
+    output: Option<TcpStream>,
+}
+
+impl AppConnections {
+    fn insert(&mut self, kind: ConnectionType, stream: TcpStream) -> Result<()> {
+        let (slot, name) = match kind {
+            ConnectionType::Control => (&mut self.control, "control"),
+            ConnectionType::Input => (&mut self.input, "input"),
+            ConnectionType::Output => (&mut self.output, "output"),
+        };
+
+        if slot.replace(stream).is_some() {
+            bail!("Received duplicate {name} connection");
+        }
+
+        Ok(())
+    }
+
+    fn into_required(self) -> Result<(TcpStream, TcpStream, TcpStream)> {
+        Ok((
+            self.control
+                .context("Failed to establish control connection")?,
+            self.input.context("Failed to establish input connection")?,
+            self.output
+                .context("Failed to establish output connection")?,
+        ))
+    }
+}
+
+async fn run_gpg_proxy(args: GpgArgs) -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
-    info!(log, "Listening for app connections on port {}", port);
+    info!(port, "Listening for app connections");
 
-    let mut cmd = tokio::process::Command::new(am_command());
+    let mut cmd = broadcast_command(GPG_APP_RECEIVER);
     let gpg_args_for_app = reconstruct_args(&args);
 
-    cmd.arg("broadcast")
-        .arg("-n")
-        .arg(GPG_APP_RECEIVER)
-        .arg("--ei")
+    cmd.arg("--ei")
         .arg("org.ddosolitary.okcagent.extra.GPG_PROTO_VER")
         .arg(GPG_PROTO_VER.to_string())
         .arg("--ei")
@@ -213,69 +322,33 @@ async fn run_gpg_proxy(args: GpgArgs, log: Logger) -> Result<()> {
     }
 
     run_am_broadcast(&mut cmd).await?;
-    info!(
-        log,
-        "Broadcast sent. Waiting for connections from the app..."
-    );
+    info!("Broadcast sent. Waiting for connections from the app...");
 
-    // Accept connections one by one and spawn handlers immediately.
-    let mut control_handle: Option<JoinHandle<Result<u8>>> = None;
-    let mut input_handle: Option<JoinHandle<Result<()>>> = None;
-    let mut output_handle: Option<JoinHandle<Result<()>>> = None;
+    let mut connections = AppConnections::default();
 
     for _ in 0..3 {
         let (mut stream, addr) = time::timeout(Duration::from_secs(15), listener.accept())
             .await
             .context("Timed out waiting for an app connection.")??;
 
-        let op_type = stream
-            .read_u8()
-            .await
-            .context("Failed to read connection type")?;
-        debug!(log, "Accepted connection"; "from" => addr, "type" => op_type);
-
-        match op_type {
-            0 => {
-                if control_handle.is_some() {
-                    bail!("Received duplicate control connection");
-                }
-                control_handle = Some(tokio::spawn(handle_control_connection(stream, log.clone())))
-            }
-            1 => {
-                if input_handle.is_some() {
-                    bail!("Received duplicate input connection");
-                }
-                input_handle = Some(tokio::spawn(handle_input_connection(stream, log.clone())));
-            }
-            2 => {
-                if output_handle.is_some() {
-                    bail!("Received duplicate output connection");
-                }
-                output_handle = Some(tokio::spawn(handle_output_connection(stream, log.clone())));
-            }
-            _ => bail!("Invalid connection type received: {}", op_type),
-        };
+        let kind = ConnectionType::try_from(
+            stream
+                .read_u8()
+                .await
+                .context("Failed to read connection type")?,
+        )?;
+        debug!(from = %addr, ?kind, "Accepted app connection");
+        connections.insert(kind, stream)?;
     }
 
-    // Ensure all three essential handlers were started.
-    let (control, input, output) = match (control_handle, input_handle, output_handle) {
-        (Some(c), Some(i), Some(o)) => (c, i, o),
-        _ => bail!("Failed to establish all three required connections."),
-    };
+    let (control, input, output) = connections.into_required()?;
+    let (exit_code, (), ()) = tokio::try_join!(
+        handle_control_connection(control),
+        handle_input_connection(input),
+        handle_output_connection(output)
+    )?;
 
-    // Wait for all handlers to complete.
-    let (control_result, input_result, output_result) = tokio::try_join!(control, input, output)
-        .context("A concurrent connection handler panicked or failed.")?;
-
-    // Check individual results
-    input_result.context("Input handler failed.")?;
-    output_result.context("Output handler failed.")?;
-    let exit_code = control_result.context("Control handler failed.")?;
-
-    info!(
-        log,
-        "All connections finished. Final status code: {}", exit_code
-    );
+    info!(exit_code, "All app connections finished");
 
     if exit_code == 0 {
         Ok(())
@@ -285,8 +358,8 @@ async fn run_gpg_proxy(args: GpgArgs, log: Logger) -> Result<()> {
 }
 
 /// Handles the control stream: receives logs/status from the app.
-async fn handle_control_connection(mut stream: TcpStream, log: Logger) -> Result<u8> {
-    info!(log, "Control connection established.");
+async fn handle_control_connection(mut stream: TcpStream) -> Result<u8> {
+    info!("Control connection established");
     loop {
         let msg = read_length_prefixed_str(&mut stream).await?;
         if msg.is_empty() {
@@ -294,51 +367,51 @@ async fn handle_control_connection(mut stream: TcpStream, log: Logger) -> Result
         }
         // Log messages received from the app
         match msg.get(..4) {
-            Some("[E] ") => error!(log, "[app] {}", &msg[4..]),
-            Some("[W] ") => warn!(log, "[app] {}", &msg[4..]),
-            _ => info!(log, "[app] {}", msg),
+            Some("[E] ") => error!("[app] {}", &msg[4..]),
+            Some("[W] ") => warn!("[app] {}", &msg[4..]),
+            _ => info!("[app] {}", msg),
         }
     }
     let status_code = stream
         .read_u8()
         .await
         .context("Failed to read final status code")?;
-    debug!(log, "Control connection finished.");
+    debug!("Control connection finished");
     Ok(status_code)
 }
 
 /// Handles the input stream: reads from stdin/file and sends to the app.
-async fn handle_input_connection(mut stream: TcpStream, log: Logger) -> Result<()> {
+async fn handle_input_connection(mut stream: TcpStream) -> Result<()> {
     let path = read_length_prefixed_str(&mut stream).await?;
-    info!(log, "Input connection established"; "source" => &path);
+    info!(source = %path, "Input connection established");
 
     if path == "-" {
         let mut stdin = io::stdin();
-        copy_to_length_prefixed(&mut stdin, &mut stream, &log).await?;
+        copy_to_length_prefixed(&mut stdin, &mut stream).await?;
     } else {
         let mut file = tokio::fs::File::open(&path)
             .await
             .context("Failed to open input file")?;
-        copy_to_length_prefixed(&mut file, &mut stream, &log).await?;
+        copy_to_length_prefixed(&mut file, &mut stream).await?;
     }
-    debug!(log, "Input connection finished.");
+    debug!("Input connection finished");
     Ok(())
 }
 
 /// Handles the output stream: receives from the app and writes to stdout/file.
-async fn handle_output_connection(mut stream: TcpStream, log: Logger) -> Result<()> {
+async fn handle_output_connection(mut stream: TcpStream) -> Result<()> {
     let path = read_length_prefixed_str(&mut stream).await?;
-    info!(log, "Output connection established"; "destination" => &path);
+    info!(destination = %path, "Output connection established");
     if path == "-" {
         let mut stdout = io::stdout();
-        copy_from_length_prefixed(&mut stream, &mut stdout, &log).await?;
+        copy_from_length_prefixed(&mut stream, &mut stdout).await?;
     } else {
         let mut file = tokio::fs::File::create(&path)
             .await
             .context("Failed to create output file")?;
-        copy_from_length_prefixed(&mut stream, &mut file, &log).await?;
+        copy_from_length_prefixed(&mut stream, &mut file).await?;
     }
-    debug!(log, "Output connection finished.");
+    debug!("Output connection finished");
     Ok(())
 }
 
@@ -354,7 +427,7 @@ async fn read_length_prefixed_str<R: AsyncRead + Unpin>(reader: &mut R) -> Resul
 }
 
 /// Reads from a source and writes to a stream using a u16-length-prefix protocol.
-async fn copy_to_length_prefixed<R, W>(source: &mut R, dest: &mut W, log: &Logger) -> Result<()>
+async fn copy_to_length_prefixed<R, W>(source: &mut R, dest: &mut W) -> Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -366,7 +439,7 @@ where
             break;
         }
         let len = u16::try_from(len_read).context("Input chunk exceeded frame size")?;
-        debug!(log, "Sending {} bytes", len_read);
+        debug!(bytes = len_read, "Sending framed payload chunk");
         dest.write_u16(len).await?;
         dest.write_all(&buf[..len_read]).await?;
     }
@@ -376,7 +449,7 @@ where
 }
 
 /// Reads from a u16-length-prefixed stream and writes the contents to a destination.
-async fn copy_from_length_prefixed<R, W>(source: &mut R, dest: &mut W, log: &Logger) -> Result<()>
+async fn copy_from_length_prefixed<R, W>(source: &mut R, dest: &mut W) -> Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -387,7 +460,7 @@ where
         if len_to_read == 0 {
             break; // EOF marker
         }
-        debug!(log, "Receiving {} bytes", len_to_read);
+        debug!(bytes = len_to_read, "Receiving framed payload chunk");
         let chunk = &mut buf[..len_to_read];
         source.read_exact(chunk).await?;
         dest.write_all(chunk).await?;

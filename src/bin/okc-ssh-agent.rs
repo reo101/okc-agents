@@ -1,19 +1,21 @@
 use clap::{Parser, Subcommand};
-use eyre::{Context, Result};
-use futures_util::future;
-use okc_agents::android::{am_command, run_am_broadcast};
+use eyre::{Context, Result, bail};
+use okc_agents::android::{broadcast_command, run_am_broadcast};
 use okc_agents::cli::{self, HasShellArgs, KillArgs, ShellArgs};
 use okc_agents::daemon;
-use slog::{error, info, o, warn, Drain, Logger};
+use okc_agents::logging::init_tracing;
 use std::env;
+use std::future;
 use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io;
 use tokio::net::{TcpListener, UnixListener, UnixStream};
 use tokio::process::Command;
-use tokio::signal::unix::{signal, SignalKind};
+use tokio::signal::unix::{SignalKind, signal};
+use tokio::sync::oneshot;
+use tracing::{error, info, warn};
 
 const SSH_PROTO_VER: u32 = 0;
 const SSH_APP_RECEIVER: &str = "org.ddosolitary.okcagent/.SshProxyReceiver";
@@ -22,20 +24,16 @@ const SSH_APP_RECEIVER: &str = "org.ddosolitary.okcagent/.SshProxyReceiver";
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Setup logger.
-    let decorator = slog_term::TermDecorator::new().build();
-    let drain = slog_term::FullFormat::new(decorator).build().fuse();
-    let drain = slog_async::Async::new(drain).build().fuse();
-    let log = Logger::root(drain, o!());
+    init_tracing();
 
     // If daemonized, run the server. Otherwise, handle CLI commands.
     if env::var(daemon::DAEMONIZE_ENV).is_ok() {
-        return run_ssh_server(log).await;
+        return run_ssh_server_from_env(future::pending()).await;
     }
 
     let cli = Cli::parse();
     match cli.command {
-        Commands::Start(args) => start_ssh_command(args, log).await?,
+        Commands::Start(args) => start_ssh_command(args).await?,
         Commands::Kill(args) => daemon::kill_agent_command(args).await?,
     }
 
@@ -44,13 +42,26 @@ async fn main() -> Result<()> {
 
 // --- Specific Business Logic for SSH Agent ---
 
-async fn run_ssh_server(log: Logger) -> Result<()> {
+async fn run_ssh_server_from_env<F>(shutdown: F) -> Result<()>
+where
+    F: future::Future<Output = ()>,
+{
     let socket_path_str = env::var(cli::AUTH_SOCK_ENV)
         .context("Expected SSH_AUTH_SOCK to be set in daemonized process")?;
     let socket_path = PathBuf::from(socket_path_str);
+    run_ssh_server(socket_path, shutdown).await
+}
 
-    if let Err(error) = tokio::fs::remove_file(&socket_path).await {
-        if error.kind() != ErrorKind::NotFound {
+async fn run_ssh_server<F>(socket_path: PathBuf, shutdown: F) -> Result<()>
+where
+    F: future::Future<Output = ()>,
+{
+    tokio::pin!(shutdown);
+
+    match tokio::fs::remove_file(&socket_path).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => {
             return Err(error).with_context(|| {
                 format!("Failed to remove stale socket at {}", socket_path.display())
             });
@@ -60,7 +71,11 @@ async fn run_ssh_server(log: Logger) -> Result<()> {
     let listener = UnixListener::bind(&socket_path)
         .with_context(|| format!("Daemon could not bind to socket at {:?}", &socket_path))?;
 
-    info!(log, "okc-ssh-agent daemon started"; "version" => env!("CARGO_PKG_VERSION"), "socket" => socket_path.display());
+    info!(
+        version = env!("CARGO_PKG_VERSION"),
+        socket = %socket_path.display(),
+        "okc-ssh-agent daemon started"
+    );
 
     let mut sig_term = signal(SignalKind::terminate())?;
     let mut sig_int = signal(SignalKind::interrupt())?;
@@ -69,45 +84,44 @@ async fn run_ssh_server(log: Logger) -> Result<()> {
     loop {
         tokio::select! {
             biased;
-            _ = sig_term.recv() => { info!(log, "Received SIGTERM, shutting down."); break; }
-            _ = sig_int.recv() => { info!(log, "Received SIGINT, shutting down."); break; }
+            _ = &mut shutdown => { info!("Received shutdown request, stopping SSH server."); break; }
+            _ = sig_term.recv() => { info!("Received SIGTERM, shutting down."); break; }
+            _ = sig_int.recv() => { info!("Received SIGINT, shutting down."); break; }
             accept_result = listener.accept() => {
                 match accept_result {
                     Ok((stream, _)) => {
-                        let conn_log = log.new(o!("id" => counter.fetch_add(1, Ordering::Relaxed)));
+                        let connection_id = counter.fetch_add(1, Ordering::Relaxed);
                         tokio::spawn(async move {
-                            if let Err(e) = handle_ssh_connection(stream, conn_log.clone()).await {
-                                error!(conn_log, "Connection failed: {:?}", e);
+                            if let Err(error) = handle_ssh_connection(stream, connection_id).await {
+                                error!(connection_id, error = ?error, "SSH connection failed");
                             }
                         });
                     }
-                    Err(error) => warn!(log, "Failed to accept incoming SSH connection"; "error" => %error),
+                    Err(error) => warn!(error = %error, "Failed to accept incoming SSH connection"),
                 }
             }
         }
     }
 
-    if let Err(error) = tokio::fs::remove_file(&socket_path).await {
-        if error.kind() != ErrorKind::NotFound {
-            warn!(log, "Failed to delete socket file"; "path" => socket_path.display(), "error" => %error);
+    match tokio::fs::remove_file(&socket_path).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => {
+            warn!(path = %socket_path.display(), error = %error, "Failed to delete socket file");
         }
     }
     Ok(())
 }
 
-async fn handle_ssh_connection(mut client_stream: UnixStream, log: Logger) -> Result<()> {
-    info!(log, "Handling new SSH client connection");
-    let (mut crx, mut ctx) = client_stream.split();
+async fn handle_ssh_connection(mut client_stream: UnixStream, connection_id: u64) -> Result<()> {
+    info!(connection_id, "Handling new SSH client connection");
 
     let app_listener = TcpListener::bind("127.0.0.1:0").await?;
     let port = app_listener.local_addr()?.port();
-    info!(log, "Listening for app on TCP port {}", port);
+    info!(connection_id, port, "Listening for app callback connection");
 
-    let mut broadcast = Command::new(am_command());
+    let mut broadcast = broadcast_command(SSH_APP_RECEIVER);
     broadcast
-        .arg("broadcast")
-        .arg("-n")
-        .arg(SSH_APP_RECEIVER)
         .arg("--ei")
         .arg("org.ddosolitary.okcagent.extra.SSH_PROTO_VER")
         .arg(SSH_PROTO_VER.to_string())
@@ -121,24 +135,20 @@ async fn handle_ssh_connection(mut client_stream: UnixStream, log: Logger) -> Re
         .await
         .context("Timed out waiting for app to connect")??;
 
-    info!(log, "App connected, proxying data"; "remote_addr" => ?app_stream.peer_addr());
-    let (mut arx, mut atx) = app_stream.split();
+    info!(connection_id, remote_addr = ?app_stream.peer_addr(), "App connected, proxying traffic");
 
-    let (r1, r2) = future::join(copy_data(&mut crx, &mut atx), copy_data(&mut arx, &mut ctx)).await;
-    r1.and(r2).context("Data proxying failed")
-}
-
-async fn copy_data<R, W>(reader: &mut R, writer: &mut W) -> Result<()>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    io::copy(reader, writer).await?;
-    writer.shutdown().await?;
+    let (client_to_app, app_to_client) =
+        io::copy_bidirectional(&mut client_stream, &mut app_stream)
+            .await
+            .context("Data proxying failed")?;
+    info!(
+        connection_id,
+        client_to_app, app_to_client, "SSH proxy session finished"
+    );
     Ok(())
 }
 
-async fn start_ssh_command(args: StartArgs, log: Logger) -> Result<()> {
+async fn start_ssh_command(args: StartArgs) -> Result<()> {
     let is_foreground = args.foreground || args.debug || !args.cmd.is_empty();
 
     let temp_dir = tempfile::Builder::new()
@@ -152,26 +162,45 @@ async fn start_ssh_command(args: StartArgs, log: Logger) -> Result<()> {
     };
 
     if is_foreground {
-        env::set_var(cli::AUTH_SOCK_ENV, &socket_path);
         cli::print_shell_exports(&socket_path, std::process::id(), &args);
 
         if !args.cmd.is_empty() {
             let mut child_cmd = Command::new(&args.cmd[0]);
-            child_cmd.args(&args.cmd[1..]).envs(env::vars());
+            child_cmd
+                .args(&args.cmd[1..])
+                .env(cli::AUTH_SOCK_ENV, &socket_path)
+                .env(cli::AGENT_PID_ENV, std::process::id().to_string());
 
-            let server_task = tokio::spawn(run_ssh_server(log.clone()));
             let mut child_process = child_cmd.spawn().context("Failed to spawn command")?;
+            let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+            let mut server_task = tokio::spawn(run_ssh_server(socket_path.clone(), async move {
+                let _ = shutdown_rx.await;
+            }));
 
             tokio::select! {
-                res = server_task => error!(log, "Server exited unexpectedly: {:?}", res),
-                status = child_process.wait() => info!(log, "Child command finished"; "status" => %status.context("Failed to wait for child process")?),
+                server_result = &mut server_task => {
+                    let server_result = server_result.context("SSH server task panicked")?;
+                    let _ = child_process.kill().await;
+                    let _ = child_process.wait().await;
+                    server_result.context("SSH server exited while child command was still running")?;
+                    bail!("SSH server exited before child command finished")
+                }
+                status = child_process.wait() => {
+                    let status = status.context("Failed to wait for child process")?;
+                    info!(%status, "Child command finished");
+                }
             }
+
+            let _ = shutdown_tx.send(());
+            server_task
+                .await
+                .context("SSH server task panicked during shutdown")??;
         } else {
-            run_ssh_server(log).await?;
+            run_ssh_server(socket_path, future::pending()).await?;
         }
     } else {
         let pid = daemon::spawn_daemon(&socket_path).await?;
-        info!(log, "Agent daemon started"; "pid" => pid);
+        info!(pid, "Agent daemon started");
         cli::print_shell_exports(&socket_path, pid, &args);
         let _persisted_socket_dir = temp_dir.keep(); // Daemon cleans up the socket when it exits.
     }

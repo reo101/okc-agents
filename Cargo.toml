@@ -5,7 +5,7 @@ authors = [
     "DDoSolitary <DDoSolitary@gmail.com>",
     "reo101 <pavel.atanasov2001@gmail.com>",
 ]
-edition = "2021"
+edition = "2024"
 description = "SSH agent for a utility that makes OpenKeychain available in your Termux shell"
 license = "MIT"
 
@@ -13,13 +13,11 @@ license = "MIT"
 eyre = "0.6"
 base64 = "0.22.1"
 clap = { version = "4.5", features = ["derive"] }
-futures-util = "0.3"
-nix = { version = "0.30", features = ["signal"] }
-slog = "2.7.0"
-slog-async = "2.8.0"
-slog-term = "2.9.0"
+nix = { version = "0.31", features = ["signal"] }
 tempfile = "3.10"
 tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [profile.release]
 lto = true
