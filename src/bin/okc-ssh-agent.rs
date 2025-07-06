@@ -1,10 +1,12 @@
 use clap::{Parser, Subcommand};
-use eyre::{bail, Context, Result};
+use eyre::{Context, Result};
 use futures_util::future;
+use okc_agents::android::{am_command, run_am_broadcast};
 use okc_agents::cli::{self, HasShellArgs, KillArgs, ShellArgs};
 use okc_agents::daemon;
 use slog::{error, info, o, warn, Drain, Logger};
 use std::env;
+use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -12,8 +14,6 @@ use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, UnixListener, UnixStream};
 use tokio::process::Command;
 use tokio::signal::unix::{signal, SignalKind};
-use tokio_stream::wrappers::TcpListenerStream;
-use tokio_stream::StreamExt;
 
 const SSH_PROTO_VER: u32 = 0;
 const SSH_APP_RECEIVER: &str = "org.ddosolitary.okcagent/.SshProxyReceiver";
@@ -49,6 +49,14 @@ async fn run_ssh_server(log: Logger) -> Result<()> {
         .context("Expected SSH_AUTH_SOCK to be set in daemonized process")?;
     let socket_path = PathBuf::from(socket_path_str);
 
+    if let Err(error) = tokio::fs::remove_file(&socket_path).await {
+        if error.kind() != ErrorKind::NotFound {
+            return Err(error).with_context(|| {
+                format!("Failed to remove stale socket at {}", socket_path.display())
+            });
+        }
+    }
+
     let listener = UnixListener::bind(&socket_path)
         .with_context(|| format!("Daemon could not bind to socket at {:?}", &socket_path))?;
 
@@ -64,21 +72,26 @@ async fn run_ssh_server(log: Logger) -> Result<()> {
             _ = sig_term.recv() => { info!(log, "Received SIGTERM, shutting down."); break; }
             _ = sig_int.recv() => { info!(log, "Received SIGINT, shutting down."); break; }
             accept_result = listener.accept() => {
-                if let Ok((stream, _)) = accept_result {
-                    let conn_log = log.new(o!("id" => counter.fetch_add(1, Ordering::Relaxed)));
-                    tokio::spawn(async move {
-                        if let Err(e) = handle_ssh_connection(stream, conn_log.clone()).await {
-                            error!(conn_log, "Connection failed: {:?}", e);
-                        }
-                    });
+                match accept_result {
+                    Ok((stream, _)) => {
+                        let conn_log = log.new(o!("id" => counter.fetch_add(1, Ordering::Relaxed)));
+                        tokio::spawn(async move {
+                            if let Err(e) = handle_ssh_connection(stream, conn_log.clone()).await {
+                                error!(conn_log, "Connection failed: {:?}", e);
+                            }
+                        });
+                    }
+                    Err(error) => warn!(log, "Failed to accept incoming SSH connection"; "error" => %error),
                 }
             }
         }
     }
 
-    tokio::fs::remove_file(&socket_path)
-        .await
-        .unwrap_or_else(|e| warn!(log, "Failed to delete socket file"; "path" => socket_path.display(), "error" => %e));
+    if let Err(error) = tokio::fs::remove_file(&socket_path).await {
+        if error.kind() != ErrorKind::NotFound {
+            warn!(log, "Failed to delete socket file"; "path" => socket_path.display(), "error" => %error);
+        }
+    }
     Ok(())
 }
 
@@ -90,10 +103,8 @@ async fn handle_ssh_connection(mut client_stream: UnixStream, log: Logger) -> Re
     let port = app_listener.local_addr()?.port();
     info!(log, "Listening for app on TCP port {}", port);
 
-    // TODO: deduplicate
-    let am_command = std::env::var("AM").unwrap_or_else(|_| "am".to_string());
-
-    let status = Command::new(am_command)
+    let mut broadcast = Command::new(am_command());
+    broadcast
         .arg("broadcast")
         .arg("-n")
         .arg(SSH_APP_RECEIVER)
@@ -102,24 +113,13 @@ async fn handle_ssh_connection(mut client_stream: UnixStream, log: Logger) -> Re
         .arg(SSH_PROTO_VER.to_string())
         .arg("--ei")
         .arg("org.ddosolitary.okcagent.extra.PROXY_PORT")
-        .arg(port.to_string())
-        .status()
+        .arg(port.to_string());
+
+    run_am_broadcast(&mut broadcast).await?;
+
+    let (mut app_stream, _) = tokio::time::timeout(Duration::from_secs(10), app_listener.accept())
         .await
-        .context("Failed to execute 'am broadcast' command")?;
-
-    if !status.success() {
-        bail!("'am broadcast' command failed with status: {}", status);
-    }
-
-    let mut app_stream = match tokio::time::timeout(
-        Duration::from_secs(10),
-        TcpListenerStream::new(app_listener).next(),
-    )
-    .await
-    {
-        Ok(Some(Ok(stream))) => stream,
-        _ => bail!("Timed out waiting for app to connect"),
-    };
+        .context("Timed out waiting for app to connect")??;
 
     info!(log, "App connected, proxying data"; "remote_addr" => ?app_stream.peer_addr());
     let (mut arx, mut atx) = app_stream.split();
@@ -164,7 +164,7 @@ async fn start_ssh_command(args: StartArgs, log: Logger) -> Result<()> {
 
             tokio::select! {
                 res = server_task => error!(log, "Server exited unexpectedly: {:?}", res),
-                status = child_process.wait() => info!(log, "Child command finished"; "status" => %status.unwrap()),
+                status = child_process.wait() => info!(log, "Child command finished"; "status" => %status.context("Failed to wait for child process")?),
             }
         } else {
             run_ssh_server(log).await?;
@@ -173,7 +173,7 @@ async fn start_ssh_command(args: StartArgs, log: Logger) -> Result<()> {
         let pid = daemon::spawn_daemon(&socket_path).await?;
         info!(log, "Agent daemon started"; "pid" => pid);
         cli::print_shell_exports(&socket_path, pid, &args);
-        let _ = temp_dir.keep(); // Leak the temp dir, daemon will clean it up.
+        let _persisted_socket_dir = temp_dir.keep(); // Daemon cleans up the socket when it exits.
     }
 
     Ok(())

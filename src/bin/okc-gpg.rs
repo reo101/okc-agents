@@ -1,12 +1,15 @@
 use base64::{engine::general_purpose::STANDARD, Engine};
 use clap::{ArgAction, Parser};
 use eyre::{bail, Context, Result};
+use okc_agents::android::{am_command, run_am_broadcast};
 use slog::{debug, error, info, o, warn, Drain, Logger};
-use tokio::task::JoinHandle;
 use std::time::Duration;
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::task::JoinHandle;
 use tokio::time;
+
+const FRAME_CHUNK_SIZE: usize = 4 * 1024;
 
 const GPG_PROTO_VER: i32 = 1;
 const GPG_APP_RECEIVER: &str = "org.ddosolitary.okcagent/.GpgProxyReceiver";
@@ -185,10 +188,7 @@ async fn run_gpg_proxy(args: GpgArgs, log: Logger) -> Result<()> {
     let port = listener.local_addr()?.port();
     info!(log, "Listening for app connections on port {}", port);
 
-    // TODO: deduplicate
-    let am_command = std::env::var("AM").unwrap_or_else(|_| "am".to_string());
-
-    let mut cmd = tokio::process::Command::new(am_command);
+    let mut cmd = tokio::process::Command::new(am_command());
     let gpg_args_for_app = reconstruct_args(&args);
 
     cmd.arg("broadcast")
@@ -212,9 +212,7 @@ async fn run_gpg_proxy(args: GpgArgs, log: Logger) -> Result<()> {
             .arg(encoded_args);
     }
 
-    cmd.status()
-        .await
-        .context("Failed to send 'am broadcast'")?;
+    run_am_broadcast(&mut cmd).await?;
     info!(
         log,
         "Broadcast sent. Waiting for connections from the app..."
@@ -225,7 +223,7 @@ async fn run_gpg_proxy(args: GpgArgs, log: Logger) -> Result<()> {
     let mut input_handle: Option<JoinHandle<Result<()>>> = None;
     let mut output_handle: Option<JoinHandle<Result<()>>> = None;
 
-    for _ in 0..=2 {
+    for _ in 0..3 {
         let (mut stream, addr) = time::timeout(Duration::from_secs(15), listener.accept())
             .await
             .context("Timed out waiting for an app connection.")??;
@@ -238,10 +236,23 @@ async fn run_gpg_proxy(args: GpgArgs, log: Logger) -> Result<()> {
 
         match op_type {
             0 => {
+                if control_handle.is_some() {
+                    bail!("Received duplicate control connection");
+                }
                 control_handle = Some(tokio::spawn(handle_control_connection(stream, log.clone())))
             }
-            1 => input_handle = Some(tokio::spawn(handle_input_connection(stream, log.clone()))),
-            2 => output_handle = Some(tokio::spawn(handle_output_connection(stream, log.clone()))),
+            1 => {
+                if input_handle.is_some() {
+                    bail!("Received duplicate input connection");
+                }
+                input_handle = Some(tokio::spawn(handle_input_connection(stream, log.clone())));
+            }
+            2 => {
+                if output_handle.is_some() {
+                    bail!("Received duplicate output connection");
+                }
+                output_handle = Some(tokio::spawn(handle_output_connection(stream, log.clone())));
+            }
             _ => bail!("Invalid connection type received: {}", op_type),
         };
     }
@@ -348,17 +359,19 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut buf = vec![0u8; 4096];
+    let mut buf = [0u8; FRAME_CHUNK_SIZE];
     loop {
         let len_read = source.read(&mut buf).await?;
         if len_read == 0 {
             break;
         }
+        let len = u16::try_from(len_read).context("Input chunk exceeded frame size")?;
         debug!(log, "Sending {} bytes", len_read);
-        dest.write_u16(len_read as u16).await?;
+        dest.write_u16(len).await?;
         dest.write_all(&buf[..len_read]).await?;
     }
     dest.write_u16(0).await?; // EOF marker
+    dest.flush().await?;
     Ok(())
 }
 
@@ -379,5 +392,6 @@ where
         source.read_exact(chunk).await?;
         dest.write_all(chunk).await?;
     }
+    dest.flush().await?;
     Ok(())
 }

@@ -1,5 +1,5 @@
 use crate::cli::{print_kill_vars, KillArgs, AGENT_PID_ENV};
-use eyre::{Context, Result};
+use eyre::{Context, ContextCompat, Result};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 use std::env;
@@ -42,5 +42,7 @@ pub async fn spawn_daemon(socket_path: &Path) -> Result<u32> {
         .spawn()
         .context("Failed to spawn daemon process")?;
 
-    Ok(child.id().unwrap_or(0))
+    child
+        .id()
+        .context("Spawned daemon process did not expose a process id")
 }
