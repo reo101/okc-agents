@@ -1,6 +1,8 @@
 use clap::{Parser, Subcommand};
 use eyre::{Context, Result, bail};
-use okc_agents::android::{broadcast_command, run_am_broadcast};
+use okc_agents::android::{
+    EXTRA_PROXY_PORT, EXTRA_SSH_PROTO_VER, SSH_PROXY_RECEIVER, broadcast_command, run_am_broadcast,
+};
 use okc_agents::cli::{self, HasShellArgs, KillArgs, ShellArgs};
 use okc_agents::daemon;
 use okc_agents::logging::init_tracing;
@@ -18,7 +20,6 @@ use tokio::sync::oneshot;
 use tracing::{error, info, warn};
 
 const SSH_PROTO_VER: u32 = 0;
-const SSH_APP_RECEIVER: &str = "org.ddosolitary.okcagent/.SshProxyReceiver";
 
 // --- Main Application Entry Point ---
 
@@ -73,6 +74,7 @@ where
 
     info!(
         version = env!("CARGO_PKG_VERSION"),
+        pid = std::process::id(),
         socket = %socket_path.display(),
         "okc-ssh-agent daemon started"
     );
@@ -120,13 +122,13 @@ async fn handle_ssh_connection(mut client_stream: UnixStream, connection_id: u64
     let port = app_listener.local_addr()?.port();
     info!(connection_id, port, "Listening for app callback connection");
 
-    let mut broadcast = broadcast_command(SSH_APP_RECEIVER);
+    let mut broadcast = broadcast_command(SSH_PROXY_RECEIVER);
     broadcast
         .arg("--ei")
-        .arg("org.ddosolitary.okcagent.extra.SSH_PROTO_VER")
+        .arg(EXTRA_SSH_PROTO_VER)
         .arg(SSH_PROTO_VER.to_string())
         .arg("--ei")
-        .arg("org.ddosolitary.okcagent.extra.PROXY_PORT")
+        .arg(EXTRA_PROXY_PORT)
         .arg(port.to_string());
 
     run_am_broadcast(&mut broadcast).await?;
@@ -150,6 +152,7 @@ async fn handle_ssh_connection(mut client_stream: UnixStream, connection_id: u64
 
 async fn start_ssh_command(args: StartArgs) -> Result<()> {
     let is_foreground = args.foreground || args.debug || !args.cmd.is_empty();
+    let current_pid = std::process::id();
 
     let temp_dir = tempfile::Builder::new()
         .prefix("okc-agent-")
@@ -161,15 +164,22 @@ async fn start_ssh_command(args: StartArgs) -> Result<()> {
         None => temp_dir.path().join("agent.sock"),
     };
 
+    info!(
+        pid = current_pid,
+        foreground = is_foreground,
+        socket = %socket_path.display(),
+        "starting SSH agent"
+    );
+
     if is_foreground {
-        cli::print_shell_exports(&socket_path, std::process::id(), &args);
+        cli::print_shell_exports(&socket_path, current_pid, &args);
 
         if !args.cmd.is_empty() {
             let mut child_cmd = Command::new(&args.cmd[0]);
             child_cmd
                 .args(&args.cmd[1..])
                 .env(cli::AUTH_SOCK_ENV, &socket_path)
-                .env(cli::AGENT_PID_ENV, std::process::id().to_string());
+                .env(cli::AGENT_PID_ENV, current_pid.to_string());
 
             let mut child_process = child_cmd.spawn().context("Failed to spawn command")?;
             let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();

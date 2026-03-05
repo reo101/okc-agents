@@ -1,7 +1,10 @@
 use base64::{Engine, engine::general_purpose::STANDARD};
 use clap::Parser;
 use eyre::{Context, ContextCompat, Result, bail};
-use okc_agents::android::{broadcast_command, run_am_broadcast};
+use okc_agents::android::{
+    EXTRA_GPG_ARGS, EXTRA_GPG_PROTO_VER, EXTRA_PROXY_PORT, GPG_PROXY_RECEIVER, broadcast_command,
+    run_am_broadcast,
+};
 use okc_agents::logging::init_tracing;
 use std::time::Duration;
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -12,7 +15,6 @@ use tracing::{debug, error, info, warn};
 const FRAME_CHUNK_SIZE: usize = 4 * 1024;
 
 const GPG_PROTO_VER: i32 = 1;
-const GPG_APP_RECEIVER: &str = "org.ddosolitary.okcagent/.GpgProxyReceiver";
 
 /// A GPG proxy for forwarding requests to the okc-agent Android app.
 ///
@@ -300,14 +302,14 @@ async fn run_gpg_proxy(args: GpgArgs) -> Result<()> {
     let port = listener.local_addr()?.port();
     info!(port, "Listening for app connections");
 
-    let mut cmd = broadcast_command(GPG_APP_RECEIVER);
+    let mut cmd = broadcast_command(GPG_PROXY_RECEIVER);
     let gpg_args_for_app = reconstruct_args(&args);
 
     cmd.arg("--ei")
-        .arg("org.ddosolitary.okcagent.extra.GPG_PROTO_VER")
+        .arg(EXTRA_GPG_PROTO_VER)
         .arg(GPG_PROTO_VER.to_string())
         .arg("--ei")
-        .arg("org.ddosolitary.okcagent.extra.PROXY_PORT")
+        .arg(EXTRA_PROXY_PORT)
         .arg(port.to_string());
 
     if !gpg_args_for_app.is_empty() {
@@ -316,9 +318,7 @@ async fn run_gpg_proxy(args: GpgArgs) -> Result<()> {
             .map(|s| STANDARD.encode(s))
             .collect::<Vec<_>>()
             .join(",");
-        cmd.arg("--esa")
-            .arg("org.ddosolitary.okcagent.extra.GPG_ARGS")
-            .arg(encoded_args);
+        cmd.arg("--esa").arg(EXTRA_GPG_ARGS).arg(encoded_args);
     }
 
     run_am_broadcast(&mut cmd).await?;
