@@ -41,15 +41,19 @@
           };
           cargoToml = lib.importTOML ./Cargo.toml;
           packageName = cargoToml.package.name;
-          okc-agent = pkgs.callPackage ./default.nix {
-            inherit src;
-            naersk = pkgs.callPackage inputs.naersk { };
-          };
+          mkPackage =
+            packageSet: extraArgs:
+            packageSet.callPackage ./default.nix ({
+              inherit src;
+              naersk = packageSet.callPackage inputs.naersk { };
+            } // extraArgs);
+          okc-agent = mkPackage pkgs { };
         in
         {
-          packages.${packageName} = okc-agent;
-
-          packages.default = config.packages.${packageName};
+          packages = {
+            ${packageName} = okc-agent;
+            default = config.packages.${packageName};
+          };
 
           checks = {
             format =
