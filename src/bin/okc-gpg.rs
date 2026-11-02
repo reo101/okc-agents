@@ -1,6 +1,6 @@
 use base64::{Engine, engine::general_purpose::STANDARD};
 use clap::Parser;
-use eyre::{Context, ContextCompat, Result, bail};
+use eyre::{Context, Result, bail};
 use okc_agents::android::{
     EXTRA_GPG_ARGS, EXTRA_GPG_PROTO_VER, EXTRA_PROXY_PORT, GPG_PROXY_RECEIVER, broadcast_command,
     run_am_broadcast,
@@ -14,7 +14,11 @@ use tracing::{debug, error, info, warn};
 
 const FRAME_CHUNK_SIZE: usize = 4 * 1024;
 
-const GPG_PROTO_VER: i32 = 1;
+const GPG_PROTO_VER: i32 = 2;
+
+#[cfg(test)]
+#[path = "tests/gpg.rs"]
+mod tests;
 
 /// A GPG proxy for forwarding requests to the okc-agent Android app.
 ///
@@ -40,6 +44,135 @@ struct GpgArgs {
     decrypt: bool,
     #[arg(long, help = "Verify a signature")]
     verify: bool,
+
+    // Key management and listing actions
+    #[arg(long, help = "List public keys")]
+    list_keys: bool,
+    #[arg(long, help = "List secret keys")]
+    list_secret_keys: bool,
+    #[arg(long, help = "Show fingerprints")]
+    fingerprint: bool,
+    #[arg(long, help = "Show fingerprints with --list-keys")]
+    with_fingerprint: bool,
+    #[arg(long, help = "Show subkey fingerprints with --list-keys")]
+    with_subkey_fingerprint: bool,
+    #[arg(long, help = "Show keygrips with --list-keys")]
+    with_keygrip: bool,
+    #[arg(long, help = "Show secret material availability with --list-keys")]
+    with_secret: bool,
+    #[arg(long, help = "Export public keys")]
+    export: bool,
+    #[arg(long, help = "Export secret keys (unsupported, use --backup)")]
+    export_secret_keys: bool,
+    #[arg(
+        long,
+        help = "Create an OpenKeychain backup (not a GnuPG secret-key export)"
+    )]
+    backup: bool,
+    #[arg(
+        long,
+        requires = "backup",
+        help = "Include secret keys in the OpenKeychain backup"
+    )]
+    backup_secret: bool,
+    #[arg(long, help = "Export SSH public keys")]
+    export_ssh_key: bool,
+    #[arg(long, help = "Import keys through OpenKeychain")]
+    import: bool,
+    #[arg(long, help = "Create a key through OpenKeychain")]
+    gen_key: bool,
+    #[arg(long, help = "Create a key through OpenKeychain (quick form)")]
+    quick_gen_key: bool,
+    #[arg(long, help = "Delete keys through OpenKeychain")]
+    delete_keys: bool,
+    #[arg(long, help = "Delete secret keys through OpenKeychain")]
+    delete_secret_keys: bool,
+    #[arg(long, help = "Edit keys through OpenKeychain")]
+    edit_key: bool,
+    #[arg(long, help = "Receive keys from a keyserver")]
+    recv_keys: bool,
+    #[arg(long, help = "Search keys on a keyserver")]
+    search_keys: bool,
+    #[arg(long, help = "Check OpenKeychain permission")]
+    check_permission: bool,
+    #[arg(long, help = "Decrypt metadata only")]
+    metadata: bool,
+    #[arg(long, help = "Show keys")]
+    show_keys: bool,
+    #[arg(long, help = "List packets")]
+    list_packets: bool,
+    #[arg(long, help = "Symmetric encryption")]
+    symmetric: bool,
+    #[arg(long, help = "Store only")]
+    store: bool,
+    #[arg(long, help = "Card status")]
+    card_status: bool,
+    #[arg(long, help = "Edit card")]
+    card_edit: bool,
+    #[arg(long, help = "Change card PIN")]
+    change_pin: bool,
+    #[arg(long, help = "Send keys to a keyserver")]
+    send_keys: bool,
+    #[arg(long, help = "Refresh keys from a keyserver")]
+    refresh_keys: bool,
+
+    // Additional recipient and option fields
+    #[arg(long, value_name = "USER-ID", help = "Additional encryption recipient")]
+    encrypt_to: Vec<String>,
+    #[arg(long, value_name = "USER-ID", help = "Hidden encryption recipient")]
+    hidden_recipient: Vec<String>,
+    #[arg(long, value_name = "PASSPHRASE", help = "Use PASSPHRASE")]
+    passphrase: Option<String>,
+    #[arg(long, value_name = "FD", help = "Read passphrase from FD")]
+    passphrase_fd: Option<String>,
+    #[arg(long, value_name = "MODE", help = "Pinentry mode")]
+    pinentry_mode: Option<String>,
+    #[arg(long, value_name = "FD", help = "Read commands from FD")]
+    command_fd: Option<String>,
+    #[arg(long, help = "Text mode")]
+    textmode: bool,
+    #[arg(long, value_name = "STRING", help = "Comment string")]
+    comment: Option<String>,
+    #[arg(long, help = "Emit version")]
+    emit_version: bool,
+    #[arg(long, value_name = "N", help = "Include certificates")]
+    include_certs: Option<String>,
+    #[arg(long, help = "Force MDC")]
+    force_mdc: bool,
+    #[arg(long, help = "Do not warn about missing MDC")]
+    no_mdc_warning: bool,
+    #[arg(long, help = "Throw key IDs")]
+    throw_keyids: bool,
+    #[arg(long, value_name = "URL", help = "Keyserver URL")]
+    keyserver: Option<String>,
+    #[arg(long, value_name = "DIR", help = "Home directory")]
+    homedir: Option<String>,
+    #[arg(long, value_name = "FILE", help = "Options file")]
+    options: Option<String>,
+    #[arg(long, value_name = "FILE", help = "Keyring file")]
+    keyring: Option<String>,
+    #[arg(long, value_name = "FILE", help = "Secret keyring file")]
+    secret_keyring: Option<String>,
+    #[arg(long, value_name = "FILE", help = "Trust database")]
+    trustdb_name: Option<String>,
+    #[arg(long, value_name = "OPTS", help = "Export options")]
+    export_options: Option<String>,
+    #[arg(long, value_name = "OPTS", help = "Import options")]
+    import_options: Option<String>,
+    #[arg(long, value_name = "MODEL", help = "Trust model")]
+    trust_model: Option<String>,
+    #[arg(long, help = "Always trust")]
+    always_trust: bool,
+    #[arg(long, help = "Use agent")]
+    use_agent: bool,
+    #[arg(long, help = "Do not use agent")]
+    no_use_agent: bool,
+    #[arg(long, help = "Do not warn about secmem")]
+    no_secmem_warning: bool,
+    #[arg(long, help = "Do not warn about permissions")]
+    no_permission_warning: bool,
+    #[arg(long, help = "No verbose mode")]
+    no_verbose: bool,
 
     // Options
     #[arg(long, short = 'a', help = "Create ASCII armored output")]
@@ -89,8 +222,8 @@ struct GpgArgs {
     // Ignored/Unsupported options for compatibility
     #[arg(long, short = 'u', value_name = "USER-ID", hide = true)]
     local_user: Option<String>,
-    #[arg(long, hide = true)]
-    default_key: bool,
+    #[arg(long, visible_alias = "default-user", value_name = "KEY-ID")]
+    default_key: Option<String>,
     #[arg(long, value_name = "algo", hide = true)]
     compress_algo: Option<String>,
     #[arg(long, hide = true)]
@@ -107,7 +240,6 @@ async fn main() -> Result<()> {
 
     let args = GpgArgs::parse();
     validate_args(&args)?;
-    warn_ignored_options(&args);
 
     info!(
         version = env!("CARGO_PKG_VERSION"),
@@ -122,66 +254,124 @@ async fn main() -> Result<()> {
 }
 
 fn validate_args(args: &GpgArgs) -> Result<()> {
-    let has_action = args.sign
-        || args.clear_sign
-        || args.detach_sign
-        || args.encrypt
-        || args.decrypt
-        || args.verify
-        || args.list_config;
-    if !has_action {
-        bail!("No action selected. Use one of --sign/--encrypt/--decrypt/--verify/--list-config.");
+    let unsupported = [
+        (args.list_keys, "list-keys"),
+        (args.list_secret_keys, "list-secret-keys"),
+        (args.fingerprint, "fingerprint"),
+        (args.with_fingerprint, "with-fingerprint"),
+        (args.with_subkey_fingerprint, "with-subkey-fingerprint"),
+        (args.with_keygrip, "with-keygrip"),
+        (args.with_secret, "with-secret"),
+        (args.with_colons, "with-colons"),
+        (args.show_keys, "show-keys"),
+        (args.export_secret_keys, "export-secret-keys"),
+        (args.import, "import"),
+        (args.gen_key, "gen-key"),
+        (args.quick_gen_key, "quick-gen-key"),
+        (args.delete_keys, "delete-keys"),
+        (args.delete_secret_keys, "delete-secret-keys"),
+        (args.edit_key, "edit-key"),
+        (args.recv_keys, "recv-keys"),
+        (args.search_keys, "search-keys"),
+        (args.send_keys, "send-keys"),
+        (args.refresh_keys, "refresh-keys"),
+        (args.list_packets, "list-packets"),
+        (args.symmetric, "symmetric"),
+        (args.store, "store"),
+        (args.card_status, "card-status"),
+        (args.card_edit, "card-edit"),
+        (args.change_pin, "change-pin"),
+        (!args.hidden_recipient.is_empty(), "hidden-recipient"),
+        (args.throw_keyids, "throw-keyids"),
+        (args.no_encrypt_to, "no-encrypt-to"),
+        (args.passphrase.is_some(), "passphrase"),
+        (args.passphrase_fd.is_some(), "passphrase-fd"),
+        (args.pinentry_mode.is_some(), "pinentry-mode"),
+        (args.command_fd.is_some(), "command-fd"),
+        (args.batch, "batch"),
+        (args.no_use_agent, "no-use-agent"),
+        (args.keyserver.is_some(), "keyserver"),
+        (args.homedir.is_some(), "homedir"),
+        (args.options.is_some(), "options"),
+        (args.keyring.is_some(), "keyring"),
+        (args.secret_keyring.is_some(), "secret-keyring"),
+        (args.trustdb_name.is_some(), "trustdb-name"),
+        (args.export_options.is_some(), "export-options"),
+        (args.import_options.is_some(), "import-options"),
+        (args.trust_model.is_some(), "trust-model"),
+        (args.always_trust, "always-trust"),
+        (args.compress_algo.is_some(), "compress-algo"),
+        (args.textmode, "textmode"),
+        (args.comment.is_some(), "comment"),
+        (args.emit_version, "emit-version"),
+        (args.include_certs.is_some(), "include-certs"),
+        (args.force_mdc, "force-mdc"),
+        (args.no_mdc_warning, "no-mdc-warning"),
+        (args.keyid_format.is_some(), "keyid-format"),
+    ];
+    for (selected, option) in unsupported {
+        if selected {
+            bail!(
+                "--{option} is not supported. Use OpenKeychain for key management and authorization."
+            );
+        }
     }
-
-    if args.list_config
-        && (args.sign
-            || args.clear_sign
-            || args.detach_sign
-            || args.encrypt
-            || args.decrypt
-            || args.verify)
+    if args.sign && !(args.encrypt || args.detach_sign || args.clear_sign) {
+        bail!(
+            "Signed-packet --sign is not supported. Use --clear-sign, --detach-sign, or --sign --encrypt."
+        );
+    }
+    if args.status_fd.as_deref().is_some_and(|fd| fd != "2") {
+        bail!("Only --status-fd 2 is supported.");
+    }
+    if let Some(level) = &args.bzip2_compress_level {
+        if level
+            .parse::<u8>()
+            .ok()
+            .filter(|level| *level <= 9)
+            .is_none()
+        {
+            bail!("Compression level must be between 0 and 9.");
+        }
+    }
+    let action_groups = [
+        args.encrypt || (args.sign && !(args.detach_sign || args.clear_sign)),
+        args.clear_sign,
+        args.detach_sign,
+        args.decrypt || args.verify,
+        args.export,
+        args.backup,
+        args.export_ssh_key,
+        args.check_permission,
+        args.list_config,
+    ];
+    if action_groups
+        .into_iter()
+        .filter(|selected| *selected)
+        .count()
+        != 1
     {
-        bail!("--list-config cannot be combined with crypto actions.");
+        bail!("Select one action, or --sign --encrypt / --decrypt --verify.");
     }
-
-    if args.clear_sign
-        && (args.sign || args.detach_sign || args.encrypt || args.decrypt || args.verify)
+    if args.backup_secret && !args.backup {
+        bail!("--backup-secret requires --backup.");
+    }
+    if args.export_ssh_key && args.files.len() > 1 {
+        bail!("--export-ssh-key accepts one key selector.");
+    }
+    if !(args.export || args.backup || args.export_ssh_key)
+        && args.files.len() > if args.verify { 2 } else { 1 }
     {
-        bail!("--clear-sign cannot be combined with other crypto actions.");
+        bail!("Too many input files for this action.");
     }
-
-    if args.detach_sign
-        && (args.sign || args.clear_sign || args.encrypt || args.decrypt || args.verify)
-    {
-        bail!("--detach-sign cannot be combined with other crypto actions.");
+    if (args.check_permission || args.list_config) && !args.files.is_empty() {
+        bail!("This action does not accept input files.");
     }
-
-    if (args.sign || args.encrypt) && (args.decrypt || args.verify) {
-        bail!("Encrypt/sign actions cannot be combined with decrypt/verify actions.");
+    if args.metadata && !args.decrypt {
+        bail!("--metadata requires --decrypt.");
     }
 
     Ok(())
-}
-
-fn warn_ignored_options(args: &GpgArgs) {
-    if args.local_user.is_some() {
-        warn!("Option --local-user is ignored by the app");
-    }
-    if args.default_key {
-        warn!("Option --default-key is ignored by the app");
-    }
-    if args.compress_algo.is_some() {
-        warn!("Option --compress-algo is ignored by the app");
-    }
-    if args.batch {
-        warn!("Option --batch is ignored by the app");
-    }
-    if args.no_batch {
-        warn!("Option --no-batch is ignored by the app");
-    }
-    if args.keyid_format.is_some() {
-        warn!("Option --keyid-format is ignored by the app");
-    }
 }
 
 /// Reconstructs a command-line argument vector from the parsed GpgArgs struct.
@@ -215,6 +405,37 @@ fn reconstruct_args(args: &GpgArgs) -> Vec<String> {
     add_flag!(args.encrypt, "--encrypt");
     add_flag!(args.decrypt, "--decrypt");
     add_flag!(args.verify, "--verify");
+    add_flag!(args.list_keys, "--list-keys");
+    add_flag!(args.list_secret_keys, "--list-secret-keys");
+    add_flag!(args.fingerprint, "--fingerprint");
+    add_flag!(args.with_fingerprint, "--with-fingerprint");
+    add_flag!(args.with_subkey_fingerprint, "--with-subkey-fingerprint");
+    add_flag!(args.with_keygrip, "--with-keygrip");
+    add_flag!(args.with_secret, "--with-secret");
+    add_flag!(args.export, "--export");
+    add_flag!(args.export_secret_keys, "--export-secret-keys");
+    add_flag!(args.backup, "--backup");
+    add_flag!(args.backup_secret, "--backup-secret");
+    add_flag!(args.export_ssh_key, "--export-ssh-key");
+    add_flag!(args.import, "--import");
+    add_flag!(args.gen_key, "--gen-key");
+    add_flag!(args.quick_gen_key, "--quick-gen-key");
+    add_flag!(args.delete_keys, "--delete-keys");
+    add_flag!(args.delete_secret_keys, "--delete-secret-keys");
+    add_flag!(args.edit_key, "--edit-key");
+    add_flag!(args.recv_keys, "--recv-keys");
+    add_flag!(args.search_keys, "--search-keys");
+    add_flag!(args.check_permission, "--check-permission");
+    add_flag!(args.metadata, "--metadata");
+    add_flag!(args.show_keys, "--show-keys");
+    add_flag!(args.list_packets, "--list-packets");
+    add_flag!(args.symmetric, "--symmetric");
+    add_flag!(args.store, "--store");
+    add_flag!(args.card_status, "--card-status");
+    add_flag!(args.card_edit, "--card-edit");
+    add_flag!(args.change_pin, "--change-pin");
+    add_flag!(args.send_keys, "--send-keys");
+    add_flag!(args.refresh_keys, "--refresh-keys");
 
     // Options
     add_flag!(args.armor, "--armor");
@@ -225,21 +446,61 @@ fn reconstruct_args(args: &GpgArgs) -> Vec<String> {
     add_flag!(args.verbose, "--verbose");
     add_flag!(args.list_config, "--list-config");
     add_flag!(args.with_colons, "--with-colons");
+    add_flag!(args.textmode, "--textmode");
+    add_flag!(args.emit_version, "--emit-version");
+    add_flag!(args.force_mdc, "--force-mdc");
+    add_flag!(args.no_mdc_warning, "--no-mdc-warning");
+    add_flag!(args.throw_keyids, "--throw-keyids");
+    add_flag!(args.always_trust, "--always-trust");
+    add_flag!(args.use_agent, "--use-agent");
+    add_flag!(args.no_use_agent, "--no-use-agent");
+    add_flag!(args.no_secmem_warning, "--no-secmem-warning");
+    add_flag!(args.no_permission_warning, "--no-permission-warning");
+    add_flag!(args.no_verbose, "--no-verbose");
 
     // Options with values
     add_option!(&args.output, "--output");
     add_option!(&args.bzip2_compress_level, "--bzip2-compress-level");
     add_option!(&args.set_filename, "--set-filename");
     add_option!(&args.status_fd, "--status-fd");
+    add_option!(&args.local_user, "--local-user");
+    add_option!(&args.default_key, "--default-key");
+    add_option!(&args.passphrase, "--passphrase");
+    add_option!(&args.passphrase_fd, "--passphrase-fd");
+    add_option!(&args.pinentry_mode, "--pinentry-mode");
+    add_option!(&args.command_fd, "--command-fd");
+    add_option!(&args.compress_algo, "--compress-algo");
+    add_option!(&args.comment, "--comment");
+    add_option!(&args.include_certs, "--include-certs");
+    add_option!(&args.keyserver, "--keyserver");
+    add_option!(&args.homedir, "--homedir");
+    add_option!(&args.options, "--options");
+    add_option!(&args.keyring, "--keyring");
+    add_option!(&args.secret_keyring, "--secret-keyring");
+    add_option!(&args.trustdb_name, "--trustdb-name");
+    add_option!(&args.export_options, "--export-options");
+    add_option!(&args.import_options, "--import-options");
+    add_option!(&args.trust_model, "--trust-model");
 
-    // Multi-value option
+    // Multi-value options
     for r in &args.recipient {
         constructed_args.push("--recipient".to_string());
         constructed_args.push(r.clone());
     }
+    for r in &args.encrypt_to {
+        constructed_args.push("--encrypt-to".to_string());
+        constructed_args.push(r.clone());
+    }
+    for r in &args.hidden_recipient {
+        constructed_args.push("--hidden-recipient".to_string());
+        constructed_args.push(r.clone());
+    }
 
-    // Positional arguments
-    constructed_args.extend(args.files.clone());
+    // Do not interpret a filename beginning with '-' as an app option.
+    if !args.files.is_empty() {
+        constructed_args.push("--".to_string());
+        constructed_args.extend(args.files.clone());
+    }
 
     constructed_args
 }
@@ -261,39 +522,6 @@ impl TryFrom<u8> for ConnectionType {
             2 => Ok(Self::Output),
             _ => bail!("Invalid connection type received: {value}"),
         }
-    }
-}
-
-#[derive(Default)]
-struct AppConnections {
-    control: Option<TcpStream>,
-    input: Option<TcpStream>,
-    output: Option<TcpStream>,
-}
-
-impl AppConnections {
-    fn insert(&mut self, kind: ConnectionType, stream: TcpStream) -> Result<()> {
-        let (slot, name) = match kind {
-            ConnectionType::Control => (&mut self.control, "control"),
-            ConnectionType::Input => (&mut self.input, "input"),
-            ConnectionType::Output => (&mut self.output, "output"),
-        };
-
-        if slot.replace(stream).is_some() {
-            bail!("Received duplicate {name} connection");
-        }
-
-        Ok(())
-    }
-
-    fn into_required(self) -> Result<(TcpStream, TcpStream, TcpStream)> {
-        Ok((
-            self.control
-                .context("Failed to establish control connection")?,
-            self.input.context("Failed to establish input connection")?,
-            self.output
-                .context("Failed to establish output connection")?,
-        ))
     }
 }
 
@@ -324,37 +552,97 @@ async fn run_gpg_proxy(args: GpgArgs) -> Result<()> {
     run_am_broadcast(&mut cmd).await?;
     info!("Broadcast sent. Waiting for connections from the app...");
 
-    let mut connections = AppConnections::default();
-
-    for _ in 0..3 {
-        let (mut stream, addr) = time::timeout(Duration::from_secs(15), listener.accept())
-            .await
-            .context("Timed out waiting for an app connection.")??;
-
-        let kind = ConnectionType::try_from(
-            stream
-                .read_u8()
-                .await
-                .context("Failed to read connection type")?,
-        )?;
-        debug!(from = %addr, ?kind, "Accepted app connection");
-        connections.insert(kind, stream)?;
-    }
-
-    let (control, input, output) = connections.into_required()?;
-    let (exit_code, (), ()) = tokio::try_join!(
-        handle_control_connection(control),
-        handle_input_connection(input),
-        handle_output_connection(output)
-    )?;
-
-    info!(exit_code, "All app connections finished");
-
-    if exit_code == 0 {
-        Ok(())
+    let inputs = if args.encrypt
+        || args.sign
+        || args.clear_sign
+        || args.detach_sign
+        || args.decrypt
+        || args.verify
+    {
+        if args.files.is_empty() {
+            vec!["-".to_string()]
+        } else {
+            args.files
+        }
     } else {
-        bail!("The app reported an error (status code: {})", exit_code)
+        Vec::new()
+    };
+    serve_gpg_connections(
+        listener,
+        inputs,
+        args.output.unwrap_or_else(|| "-".to_string()),
+    )
+    .await
+}
+
+async fn serve_gpg_connections(
+    listener: TcpListener,
+    allowed_inputs: Vec<String>,
+    allowed_output: String,
+) -> Result<()> {
+    let (mut control, addr) = time::timeout(Duration::from_secs(15), listener.accept())
+        .await
+        .context("Timed out waiting for the app control connection.")??;
+    let kind = ConnectionType::try_from(
+        time::timeout(Duration::from_secs(15), control.read_u8())
+            .await
+            .context("Timed out reading control connection type")?
+            .context("Failed to read connection type")?,
+    )?;
+    if !matches!(kind, ConnectionType::Control) {
+        bail!("Expected the control connection first, got {kind:?}");
     }
+    debug!(from = %addr, "Accepted control connection");
+
+    let control_task = handle_control_connection(control);
+    tokio::pin!(control_task);
+    let mut inputs = tokio::task::JoinSet::new();
+    let mut outputs = tokio::task::JoinSet::new();
+    let exit_code = loop {
+        tokio::select! {
+            // The app closes data streams before sending its final status. Accept
+            // queued connections first so fast, output-only actions lose no data.
+            biased;
+            accepted = listener.accept() => {
+                let (mut stream, addr) = accepted?;
+                let kind = ConnectionType::try_from(
+                    time::timeout(Duration::from_secs(15), stream.read_u8())
+                        .await
+                        .context("Timed out reading connection type")??,
+                )?;
+                debug!(from = %addr, ?kind, "Accepted app connection");
+                match kind {
+                    ConnectionType::Control => bail!("Received duplicate control connection"),
+                    ConnectionType::Input => { inputs.spawn(handle_input_connection(stream, allowed_inputs.clone())); }
+                    ConnectionType::Output => { outputs.spawn(handle_output_connection(stream, allowed_output.clone())); }
+                }
+            }
+            result = inputs.join_next(), if !inputs.is_empty() => {
+                result.expect("Input task exists").context("Input handler panicked")??;
+            }
+            result = outputs.join_next(), if !outputs.is_empty() => {
+                result.expect("Output task exists").context("Output handler panicked")??;
+            }
+            status = &mut control_task => { break status?; }
+        }
+    };
+
+    // An API action can stop reading input early. Never leave a stdin reader
+    // alive after completion or failure. JoinSet also cancels tasks on errors.
+    inputs.abort_all();
+    if exit_code != 0 {
+        bail!("The app reported an error (status code: {exit_code})");
+    }
+    time::timeout(Duration::from_secs(15), async {
+        while let Some(result) = outputs.join_next().await {
+            result.context("Output handler panicked")??;
+        }
+        Ok::<_, eyre::Report>(())
+    })
+    .await
+    .context("Timed out draining app output")??;
+    info!(exit_code, "All app connections finished");
+    Ok(())
 }
 
 /// Handles the control stream: receives logs/status from the app.
@@ -369,6 +657,7 @@ async fn handle_control_connection(mut stream: TcpStream) -> Result<u8> {
         match msg.get(..4) {
             Some("[E] ") => error!("[app] {}", &msg[4..]),
             Some("[W] ") => warn!("[app] {}", &msg[4..]),
+            _ if msg.starts_with("[GNUPG:] ") => eprintln!("{msg}"),
             _ => info!("[app] {}", msg),
         }
     }
@@ -381,13 +670,41 @@ async fn handle_control_connection(mut stream: TcpStream) -> Result<u8> {
 }
 
 /// Handles the input stream: reads from stdin/file and sends to the app.
-async fn handle_input_connection(mut stream: TcpStream) -> Result<()> {
+async fn handle_input_connection(mut stream: TcpStream, allowed_paths: Vec<String>) -> Result<()> {
     let path = read_length_prefixed_str(&mut stream).await?;
+    if !allowed_paths.contains(&path) {
+        bail!("The app requested an input path not selected by this invocation");
+    }
     info!(source = %path, "Input connection established");
 
     if path == "-" {
-        let mut stdin = io::stdin();
-        copy_to_length_prefixed(&mut stdin, &mut stream).await?;
+        // Tokio's stdin uses a blocking-pool read that prevents runtime shutdown
+        // when an API action finishes before stdin reaches EOF. A bounded worker
+        // thread can be discarded at process exit without holding that pool open.
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        std::thread::spawn(move || {
+            let mut input = std::io::stdin().lock();
+            loop {
+                let mut bytes = vec![0; FRAME_CHUNK_SIZE];
+                let frame = std::io::Read::read(&mut input, &mut bytes).map(|size| {
+                    bytes.truncate(size);
+                    bytes
+                });
+                let finished = frame.as_ref().map_or(true, Vec::is_empty);
+                if sender.blocking_send(frame).is_err() || finished {
+                    break;
+                }
+            }
+        });
+        while let Some(frame) = receiver.recv().await {
+            let bytes = frame.context("Failed to read stdin")?;
+            stream.write_u16(bytes.len() as u16).await?;
+            stream.write_all(&bytes).await?;
+            if bytes.is_empty() {
+                stream.shutdown().await?;
+                break;
+            }
+        }
     } else {
         let mut file = tokio::fs::File::open(&path)
             .await
@@ -399,8 +716,11 @@ async fn handle_input_connection(mut stream: TcpStream) -> Result<()> {
 }
 
 /// Handles the output stream: receives from the app and writes to stdout/file.
-async fn handle_output_connection(mut stream: TcpStream) -> Result<()> {
+async fn handle_output_connection(mut stream: TcpStream, allowed_path: String) -> Result<()> {
     let path = read_length_prefixed_str(&mut stream).await?;
+    if path != allowed_path {
+        bail!("The app requested an output path not selected by this invocation");
+    }
     info!(destination = %path, "Output connection established");
     if path == "-" {
         let mut stdout = io::stdout();

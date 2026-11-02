@@ -8,6 +8,7 @@
   extraEnv ? { },
   extraNativeBuildInputs ? [ ],
   extraBuildInputs ? [ ],
+  mode ? null,
 # , llvmPackages # Optional
 # , protobuf     # Optional
 }:
@@ -43,5 +44,8 @@ naersk.buildPackage (
   }
   // lib.optionalAttrs (cargoBuildTarget != null) {
     CARGO_BUILD_TARGET = cargoBuildTarget;
+  }
+  // lib.optionalAttrs (mode != null) {
+    inherit mode;
   }
 )

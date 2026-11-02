@@ -1,27 +1,9 @@
-on: push
+name: Build and test
+on: [push, pull_request]
 jobs:
-  build:
-    strategy:
-      fail-fast: false
-      matrix:
-        target: [x86_64-linux-android, i686-linux-android, aarch64-linux-android, armv7-linux-androideabi]
-    runs-on: ubuntu-20.04
+  checks:
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@master
-      - env:
-          TARGET: ${{ matrix.target }}
-        run: |
-          rustup update
-          rustup target add $TARGET
-          ./build-termux.sh
-          tar czf release.tar.gz -C target/$TARGET/debug okc-ssh-agent okc-gpg
-      - if: github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/')
-        run: |
-          git fetch --unshallow --tags
-          mkdir -p ~/.ssh
-          echo ${{ secrets.DEPLOYKEY }} | base64 -d > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan web.sourceforge.net > ~/.ssh/known_hosts
-          scp \
-              release.tar.gz \
-              ddosolitary@web.sourceforge.net:/home/project-web/ddosolitary-builds/htdocs/okc-agents/okc-agents-$(git describe --tags)-$(echo ${{ matrix.target }} | cut -d - -f 1).tar.gz
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - run: nix flake check -L

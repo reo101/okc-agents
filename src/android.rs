@@ -27,14 +27,19 @@ pub fn broadcast_command(receiver: &str) -> Command {
 }
 
 pub async fn run_am_broadcast(command: &mut Command) -> Result<()> {
-    let status = command
-        .status()
+    let output = command
+        .output()
         .await
         .context("Failed to execute 'am broadcast' command")?;
 
-    if status.success() {
+    if output.status.success() {
         Ok(())
     } else {
-        bail!("'am broadcast' command failed with status: {status}")
+        bail!(
+            "'am broadcast' command failed with status: {}: {}{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
     }
 }

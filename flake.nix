@@ -37,16 +37,20 @@
               ./Cargo.toml
               ./Cargo.lock
               ./src
+              ./tests
             ];
           };
           cargoToml = lib.importTOML ./Cargo.toml;
           packageName = cargoToml.package.name;
           mkPackage =
             packageSet: extraArgs:
-            packageSet.callPackage ./default.nix ({
-              inherit src;
-              naersk = packageSet.callPackage inputs.naersk { };
-            } // extraArgs);
+            packageSet.callPackage ./default.nix (
+              {
+                inherit src;
+                naersk = packageSet.callPackage inputs.naersk { };
+              }
+              // extraArgs
+            );
           okc-agent = mkPackage pkgs { };
         in
         {
@@ -67,9 +71,18 @@
                 }
                 ''
                   ${lib.getExe' pkgs.rustfmt "cargo-fmt"} fmt --manifest-path ${src}/Cargo.toml -- --check
-                  ${lib.getExe pkgs.nixfmt-rfc-style} --check ${src}
+                  ${lib.getExe pkgs.nixfmt-rfc-style} --check ${./flake.nix} ${./default.nix}
                   touch $out
                 '';
+            clippy = mkPackage pkgs {
+              mode = "clippy";
+              extraEnv.RUSTFLAGS = "-D warnings";
+            };
+            tests = mkPackage pkgs { mode = "test"; };
+            gpg-cli = pkgs.runCommand "check-gpg-cli" { nativeBuildInputs = [ pkgs.python3 ]; } ''
+              python3 ${./tests/test-gpg-cli.py} ${config.packages.${packageName}}/bin/okc-gpg ${config.packages.${packageName}}/bin/okc-ssh-agent
+              touch "$out"
+            '';
             ${packageName} = config.packages.${packageName};
           };
 
