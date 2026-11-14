@@ -49,6 +49,8 @@ def main():
         return
     if len(sys.argv) > 1 and sys.argv[1] == "broadcast":
         arguments = sys.argv[1:]
+        assert "--user" in arguments, arguments
+        assert arguments[arguments.index("--user") + 1] == "0", arguments
         port = arguments[arguments.index("org.ddosolitary.okcagent.extra.PROXY_PORT") + 1]
         if any("SshProxyReceiver" in item for item in arguments):
             forwarded = ["ssh"]

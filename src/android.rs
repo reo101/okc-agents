@@ -22,7 +22,8 @@ pub fn am_command() -> &'static str {
 
 pub fn broadcast_command(receiver: &str) -> Command {
     let mut command = Command::new(am_command());
-    command.arg("broadcast").arg("-n").arg(receiver);
+    command.arg("broadcast").arg("--user").arg("0");
+    command.arg("-n").arg(receiver);
     command
 }
 
